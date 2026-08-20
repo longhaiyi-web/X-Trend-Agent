@@ -25,12 +25,32 @@ MEDIUM_RELEVANCE_SIGNALS: tuple[tuple[str, str], ...] = (
     (r"\b(cloud|database|data platform|infrastructure|runtime|storage)\b", "云 / 数据基础设施"),
 )
 
+PACKAGE_SOURCE_TYPES = {"软件包生态 API", "开源趋势 API"}
+COMMUNITY_SOURCE_TYPES = {"开发者社区 API", "科技社区 RSS"}
+
 
 def _event_text(event: EventDraft) -> str:
     return " ".join(
         [event.title, event.summary]
         + [f"{item.title} {item.description}" for item in event.items]
     ).lower()
+
+
+def _is_package_or_repo_event(event: EventDraft) -> bool:
+    return bool(event.items) and all(item.source_type in PACKAGE_SOURCE_TYPES for item in event.items)
+
+
+def _is_clear_ecosystem_trend(event: EventDraft) -> bool:
+    """Registry/repository updates need breadth or independent corroboration to count as a trend."""
+    if len(event.items) < 2 or not _is_package_or_repo_event(event):
+        return False
+    source_count = len({item.source_name for item in event.items})
+    type_count = len({item.source_type for item in event.items})
+    return type_count >= 2 or source_count >= 2 or len(event.items) >= 5
+
+
+def _has_community_source(event: EventDraft) -> bool:
+    return any(item.source_type in COMMUNITY_SOURCE_TYPES for item in event.items)
 
 
 def _recency(event: EventDraft, now: datetime) -> tuple[float, str]:
@@ -56,7 +76,15 @@ def _trend_signal(event: EventDraft) -> tuple[float, str]:
     source_count = len({item.source_name for item in event.items})
     type_count = len({item.source_type for item in event.items})
 
-    if type_count >= 3:
+    weak_registry_cluster = (
+        raw_count > 1
+        and _is_package_or_repo_event(event)
+        and not _is_clear_ecosystem_trend(event)
+    )
+
+    if weak_registry_cluster:
+        score = 2.0 if raw_count == 2 else 4.0
+    elif type_count >= 3:
         score = 20.0
     elif type_count == 2:
         score = min(20.0, 17.0 + min(3, raw_count - 2))
@@ -71,9 +99,14 @@ def _trend_signal(event: EventDraft) -> tuple[float, str]:
     elif raw_count == 2:
         score = 9.0
     else:
-        score = 2.0 if event.event_type == "开源项目 / GitHub 工具" else 3.0
+        score = 1.0 if _is_package_or_repo_event(event) else 3.0
 
-    if type_count > 1:
+    if weak_registry_cluster:
+        detail = (
+            f"同一 npm/GitHub 来源只有 {raw_count} 条相关更新，缺少跨来源印证且规模不足；"
+            "不按明显生态趋势计分"
+        )
+    elif type_count > 1:
         detail = f"{raw_count} 条原始记录覆盖 {source_count} 个来源、{type_count} 种来源类型，形成跨类型趋势信号"
     elif source_count > 1:
         detail = f"{raw_count} 条原始记录来自 {source_count} 个独立来源，已有交叉印证"
@@ -139,27 +172,29 @@ def _engagement_numbers(text: str) -> tuple[int, int, int]:
 def _discussion(event: EventDraft) -> tuple[float, str]:
     text = _event_text(event)
     reactions, comments, stars = _engagement_numbers(text)
-    community_signal = min(6.0, math.log10(1 + reactions + comments * 2) * 2.2)
+    community_signal = min(8.0, math.log10(1 + reactions + comments * 2) * 2.6)
     star_signal = min(3.0, math.log10(1 + stars) * 0.9)
     debate_terms = (
         "why", "how", " vs ", "risk", "security", "benchmark", "pricing",
         "future", "limitation", "trust", "tradeoff", "controversy", "lessons",
     )
     matched = [term.strip() for term in debate_terms if term in text]
+    registry_only = _is_package_or_repo_event(event)
+    clear_ecosystem_trend = _is_clear_ecosystem_trend(event)
     type_bonus = {
         "技术观点 / 争议文章": 4.0,
         "开发者经验 / 案例分享": 2.5,
         "研究 / 新技术进展": 2.5,
-        "生态集中更新 / 软件包家族更新": 2.0,
-        "行业新闻 / 公司动态": 1.5,
-        "产品 / 工具发布": 1.5,
+        "生态集中更新 / 软件包家族更新": 2.0 if clear_ecosystem_trend else 0.0,
+        "行业新闻 / 公司动态": 3.5 if not registry_only else 1.0,
+        "产品 / 工具发布": 3.5 if not registry_only else 0.0,
         "开源项目 / GitHub 工具": 0.5,
     }[event.event_type]
     score = min(20.0, 4.0 + community_signal + star_signal + type_bonus + min(5.0, len(matched) * 1.25))
 
     signals: list[str] = [f"{event.event_type}提供 {type_bonus:g} 分讨论基础"]
     if reactions or comments:
-        signals.append(f"公开互动 {reactions} reactions / {comments} comments")
+        signals.append(f"公开互动 {reactions} reactions / {comments} comments，作为社区讨论优先信号")
     if stars:
         signals.append(f"GitHub stars 仅折算 {star_signal:.1f} 分，不单独决定推荐")
     if matched:
@@ -167,29 +202,34 @@ def _discussion(event: EventDraft) -> tuple[float, str]:
     return round(score, 1), "；".join(signals)
 
 
-def _content_value(event: EventDraft) -> tuple[float, str]:
+def _content_value(event: EventDraft, discussion_score: float) -> tuple[float, str]:
     score = 2.0
     reasons: list[str] = []
+    registry_only = _is_package_or_repo_event(event)
+    clear_ecosystem_trend = _is_clear_ecosystem_trend(event)
     if len(event.summary) >= 80:
         score += 1.5
         reasons.append("原始描述提供足够上下文")
-    if len(event.items) > 1:
+    if len(event.items) > 1 and (not registry_only or clear_ecosystem_trend):
         score += 1.5
         reasons.append("有多条可追溯记录可形成判断")
     if len({item.source_type for item in event.items}) > 1:
         score += 1.0
         reasons.append("跨来源类型便于交叉验证")
     type_value = {
-        "产品 / 工具发布": 2.5,
+        "产品 / 工具发布": 3.5 if not registry_only else 0.5,
         "开源项目 / GitHub 工具": 1.0,
-        "生态集中更新 / 软件包家族更新": 2.5,
-        "行业新闻 / 公司动态": 2.0,
+        "生态集中更新 / 软件包家族更新": 2.5 if clear_ecosystem_trend else 0.0,
+        "行业新闻 / 公司动态": 3.0 if not registry_only else 1.0,
         "技术观点 / 争议文章": 2.5,
         "开发者经验 / 案例分享": 2.5,
         "研究 / 新技术进展": 2.0,
     }[event.event_type]
     score += type_value
     reasons.append(f"{event.event_type}可形成专属内容结构")
+    if _has_community_source(event) and discussion_score >= 10:
+        score += 1.5
+        reasons.append("公开互动达到社区高讨论优先级")
     if re.search(r"\b(why|how|launch|release|benchmark|risk|lessons|case study)\b", _event_text(event)):
         score += 1.0
         reasons.append("存在明确叙事或判断抓手")
@@ -222,7 +262,11 @@ def _failed_thresholds(row: dict, thresholds: tuple[tuple[str, bool], ...]) -> s
 def _recommendation_decision(row: dict) -> tuple[str, str]:
     event: EventDraft = row["draft"]
     single_github = _is_single_github(event)
-    grouped_trend = len(event.items) > 1 and row["trend"] >= 9
+    registry_cluster = len(event.items) > 1 and _is_package_or_repo_event(event)
+    clear_ecosystem_trend = _is_clear_ecosystem_trend(event)
+    grouped_trend = len(event.items) > 1 and row["trend"] >= 9 and (
+        not registry_cluster or clear_ecosystem_trend
+    )
 
     if single_github:
         thresholds = (
@@ -245,6 +289,13 @@ def _recommendation_decision(row: dict) -> tuple[str, str]:
             "stars 与 AI 关键词不能单独触发推荐。",
         )
 
+    if registry_cluster and not clear_ecosystem_trend:
+        return (
+            "观察",
+            f"总分 {row['score']:.1f}，但同一 npm/GitHub 来源只有 {len(event.items)} 条相关更新，"
+            "既无跨来源/跨类型印证，也未达到 5 条的集中规模；因此未达到明显生态趋势门槛，保留观察。",
+        )
+
     if grouped_trend:
         thresholds = (
             (f"总分 {row['score']:.1f} 未达到 62", row["score"] >= 62),
@@ -257,11 +308,19 @@ def _recommendation_decision(row: dict) -> tuple[str, str]:
         )
         recommend = all(passed for _, passed in thresholds)
     else:
+        priority_editorial_event = (
+            event.event_type in {"产品 / 工具发布", "行业新闻 / 公司动态"}
+            and not _is_package_or_repo_event(event)
+        )
+        minimum_discussion = 7 if priority_editorial_event else 8
         thresholds = (
             (f"总分 {row['score']:.1f} 未达到 50", row["score"] >= 50),
             (f"行业相关度 {row['relevance']:.0f}/25 不是高相关", row["tier"] == "高相关"),
             (f"内容价值 {row['content']:.1f}/10 未达到 6", row["content"] >= 6),
-            (f"可讨论性 {row['discussion']:.1f}/20 未达到 8", row["discussion"] >= 8),
+            (
+                f"可讨论性 {row['discussion']:.1f}/20 未达到 {minimum_discussion}",
+                row["discussion"] >= minimum_discussion,
+            ),
         )
         recommend = all(passed for _, passed in thresholds)
     if recommend:
@@ -351,7 +410,7 @@ def rank_events(
         trend_score, trend_detail = _trend_signal(draft)
         relevance_score, relevance_detail, relevance_tier = _relevance(draft)
         discussion_score, discussion_detail = _discussion(draft)
-        content_score, content_detail = _content_value(draft)
+        content_score, content_detail = _content_value(draft, discussion_score)
         feedback_score, feedback_detail = _feedback(draft, preferences)
         base_score = recency_score + trend_score + relevance_score + discussion_score + content_score
         total = round(max(0.0, min(100.0, base_score + feedback_score)), 1)
