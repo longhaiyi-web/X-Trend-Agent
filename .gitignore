@@ -1,0 +1,40 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+
+# Environment files and logs
+.env
+.env.*
+*.log
+
+# Sensitive configuration and credentials
+.streamlit/secrets.toml
+*secret*
+*credentials*
+*token*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local application state
+data/review_state.json
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Common system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
